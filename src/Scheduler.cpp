@@ -160,7 +160,6 @@ void Scheduler::batchGeneratorThread() {
 		if (elapsed_cycles < Config::batch_process_freq) continue;
 		elapsed_cycles = 0;
 
-		// Skip colliding names without losing the generation cycle.
 		for (uint32_t attempt = 0; attempt < 1000; ++attempt) {
 			const std::string name = makeBatchName(
 				next_batch_number.fetch_add(1));

@@ -25,9 +25,6 @@ public:
 	std::vector<int> page_table;
 	bool memory_allocated;
 
-	// The first 64 bytes of virtual memory form the symbol-table segment.
-	// symbol_table mirrors the values for reporting, while symbol_offsets
-	// records the actual two-byte virtual-memory location of each variable.
 	std::unordered_map<std::string, uint16_t> symbol_table;
 	std::unordered_map<std::string, uint32_t> symbol_offsets;
 	uint32_t next_symbol_offset;

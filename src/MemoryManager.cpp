@@ -34,7 +34,6 @@ MemoryManager::MemoryManager(uint32_t max_mem, uint32_t frame_size)
 		physical_memory.emplace_back(static_cast<int>(index), frame_size);
 	}
 
-	// Each emulator run starts with an empty backing store.
 	std::ofstream store(backing_store_path, std::ios::trunc);
 }
 
@@ -127,7 +126,6 @@ int MemoryManager::handlePageFault(Process* process, uint32_t page_index) {
 			}
 		}
 
-		// Defensive fallback: the deque should contain every occupied frame.
 		if (target_frame == -1) {
 			for (const Frame& frame : physical_memory) {
 				if (!frame.is_free) {

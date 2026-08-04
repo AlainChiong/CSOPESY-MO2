@@ -108,7 +108,6 @@ namespace {
 			std::getline(line_stream, value);
 			value = trim(value);
 
-			// Accept the old MCO1 spelling, but store the MCO2 spelling.
 			if (key == "delay-per-exec") key = "delays-per-exec";
 
 			if (allowed_keys.find(key) == allowed_keys.end()) {
