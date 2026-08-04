@@ -127,9 +127,14 @@ void ScreenManager::resumeScreen(const std::string& process_name) {
 	}
 
 	if (process.status == "FINISHED") {
-		std::cout << "Process " << process_name << " not found." << std::endl;
-		return;
-	}
+        if (process.customProcess) {
+            displayProcessDetails(process);
+        }
+        else {
+            std::cout << "Process " << process_name << " not found." << std::endl;
+        }
+        return;
+    }
 
 	runProcessScreen(process_name);
 }

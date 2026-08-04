@@ -24,6 +24,7 @@ public:
 	uint32_t num_pages;
 	std::vector<int> page_table;
 	bool memory_allocated;
+	bool custom_process;
 
 	std::unordered_map<std::string, uint16_t> symbol_table;
 	std::unordered_map<std::string, uint32_t> symbol_offsets;
@@ -51,6 +52,7 @@ public:
 		  num_pages(pages),
 		  page_table(pages, -1),
 		  memory_allocated(false),
+		  custom_process(false),
 		  next_symbol_offset(0),
 		  program_counter(0),
 		  state(ProcessState::READY),

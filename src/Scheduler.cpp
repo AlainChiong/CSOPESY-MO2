@@ -109,19 +109,24 @@ bool Scheduler::createProcess(const std::string& name, uint32_t memory_size) {
 
 bool Scheduler::createProcess(const std::string& name, uint32_t memory_size, const std::string& custom_ins) {
 	if (name.empty()) return false;
+
 	std::vector<std::string> instructions =
 		InstructionUtils::parseCustomInstructions(custom_ins);
 	if (instructions.empty()) return false;
 
 	std::lock_guard<std::mutex> lock(scheduler_mutex);
 	if (memory_manager == nullptr) return false;
+
 	for (const auto& process : process_list) {
 		if (process->name == name) return false;
 	}
 
-	auto process = std::make_shared<Process>(name, next_process_id.fetch_add(1),
-		memory_size, 0);
+	auto process = std::make_shared<Process>(
+		name, next_process_id.fetch_add(1), memory_size, 0);
+
 	if (!memory_manager->allocateMemory(process.get())) return false;
+
+	process->custom_process = true;
 	process->instructions = std::move(instructions);
 
 	process_list.push_back(process);
@@ -344,6 +349,7 @@ ProcessView Scheduler::makeProcessView(const Process& process) const {
 	view.residentMemory = memory_manager == nullptr
 		? 0
 		: memory_manager->getResidentMemory(&process);
+    view.customProcess = process.custom_process;
 	view.accessViolation = process.access_violation;
 	view.violationTime = process.violation_time;
 	view.invalidAddress = process.invalid_address;

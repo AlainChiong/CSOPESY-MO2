@@ -352,41 +352,79 @@ void ConsoleManager::processScreenCommand(const std::string& command) {
 	}
 
 	std::string process_name;
-	std::string memory_text;
-	if (!(command_stream >> process_name >> memory_text)) {
+	if (!(command_stream >> process_name)) {
 		std::cout << "invalid command" << std::endl;
 		return;
 	}
 
-	uint32_t memory_size = 0;
-	if (!parseUint32(memory_text, memory_size) || !isValidMemoryValue(memory_size)) {
-		std::cout << "invalid memory allocation" << std::endl;
-		return;
-	}
-
 	if (flag == "-s") {
+		std::string memory_text;
+		uint32_t memory_size = 0;
+
+		if (!(command_stream >> memory_text) ||
+			!parseUint32(memory_text, memory_size) ||
+			!isValidMemoryValue(memory_size)) {
+			std::cout << "invalid memory allocation" << std::endl;
+			return;
+		}
+
 		if (hasExtraArgument(command_stream)) {
 			std::cout << "invalid command" << std::endl;
 			return;
 		}
+
 		ScreenManager::getInstance().createScreen(process_name, memory_size);
 		displayMainMenu();
 		return;
 	}
 
-	std::string instruction_text;
-	std::getline(command_stream, instruction_text);
-	instruction_text = trim(instruction_text);
+	std::string remaining_text;
+	std::getline(command_stream, remaining_text);
+	remaining_text = trim(remaining_text);
 
-	if (instruction_text.size() < 2 || instruction_text.front() != '"' ||
+	if (remaining_text.empty()) {
+		std::cout << "invalid command" << std::endl;
+		return;
+	}
+
+	uint32_t memory_size = 0;
+	std::string instruction_text;
+
+	if (remaining_text.front() == '"') {
+		memory_size = Config::max_mem_per_proc;
+		instruction_text = remaining_text;
+	}
+	else {
+		std::istringstream custom_stream(remaining_text);
+		std::string memory_text;
+
+		if (!(custom_stream >> memory_text) ||
+			!parseUint32(memory_text, memory_size) ||
+			!isValidMemoryValue(memory_size)) {
+			std::cout << "invalid memory allocation" << std::endl;
+			return;
+		}
+
+		std::getline(custom_stream, instruction_text);
+		instruction_text = trim(instruction_text);
+	}
+
+	if (!isValidMemoryValue(memory_size)) {
+		std::cout << "invalid memory allocation" << std::endl;
+		return;
+	}
+
+	if (instruction_text.size() < 2 ||
+		instruction_text.front() != '"' ||
 		instruction_text.back() != '"') {
 		std::cout << "invalid command" << std::endl;
 		return;
 	}
 
 	instruction_text = instruction_text.substr(1, instruction_text.size() - 2);
-	ScreenManager::getInstance().createCustomScreen(process_name, memory_size,
-		instruction_text);
+
+	ScreenManager::getInstance().createCustomScreen(
+		process_name, memory_size, instruction_text);
 	displayMainMenu();
 }
 

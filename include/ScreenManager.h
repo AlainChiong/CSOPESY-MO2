@@ -21,6 +21,7 @@ struct ProcessView {
 	std::string violationTime;
 	uint32_t invalidAddress = 0;
 	std::vector<std::string> logs;
+    bool customProcess = false;
 };
 
 struct SystemView {
