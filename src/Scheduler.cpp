@@ -372,10 +372,10 @@ bool Scheduler::getProcessByName(const std::string& name, ProcessView& out_view,
 }
 
 double Scheduler::getCPUUtilization() const {
-	const uint64_t total = getTotalCpuTicks();
-	if (total == 0) return 0.0;
-	return static_cast<double>(active_ticks.load()) * 100.0 /
-		static_cast<double>(total);
+	if (Config::num_cpu == 0) return 0.0;
+
+	return static_cast<double>(getUsedCores()) * 100.0 /
+		static_cast<double>(Config::num_cpu);
 }
 
 int Scheduler::getUsedCores() const {
