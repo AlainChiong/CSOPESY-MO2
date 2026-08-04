@@ -1,7 +1,7 @@
 #include "InstructionUtils.h"
 
 #include "MemoryManager.h"
-#include "Process1.h"
+#include "Process.h"
 
 #include <algorithm>
 #include <cctype>

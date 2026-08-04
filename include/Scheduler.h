@@ -2,7 +2,7 @@
 #define SCHEDULER_H
 
 #include "MemoryManager.h"
-#include "Process1.h"
+#include "Process.h"
 #include "ScreenManager.h"
 
 #include <atomic>
