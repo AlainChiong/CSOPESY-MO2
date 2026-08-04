@@ -1,246 +1,412 @@
 #include "Scheduler.h"
+
 #include "Config.h"
 #include "InstructionUtils.h"
-#include <chrono>
+
 #include <algorithm>
+#include <chrono>
+#include <iomanip>
+#include <limits>
+#include <random>
+#include <sstream>
+
+namespace {
+	constexpr std::chrono::milliseconds CPU_CYCLE_DURATION(10);
+
+	uint32_t rollProcessMemory() {
+		std::vector<uint32_t> choices;
+		uint32_t current = Config::min_mem_per_proc;
+		while (current <= Config::max_mem_per_proc) {
+			choices.push_back(current);
+			if (current > Config::max_mem_per_proc / 2) break;
+			current *= 2;
+		}
+
+		if (choices.empty()) return Config::min_mem_per_proc;
+		thread_local std::mt19937 generator(std::random_device{}());
+		std::uniform_int_distribution<size_t> distribution(0, choices.size() - 1);
+		return choices[distribution(generator)];
+	}
+
+	std::string makeBatchName(uint32_t number) {
+		std::ostringstream output;
+		output << 'p' << std::setw(2) << std::setfill('0') << number;
+		return output.str();
+	}
+}
 
 Scheduler& Scheduler::getInstance() {
-    static Scheduler instance;
-    return instance;
+	static Scheduler instance;
+	return instance;
 }
 
 Scheduler::~Scheduler() {
-    stop();
+	stop();
 }
 
 void Scheduler::setMemoryManager(MemoryManager* manager) {
-    memory_manager = manager;
+	std::lock_guard<std::mutex> lock(scheduler_mutex);
+	memory_manager = manager;
 }
 
 void Scheduler::start() {
-    running = true;
-    for (uint32_t i = 0; i < Config::num_cpu; ++i) {
-        cpu_threads.emplace_back(&Scheduler::cpuWorkerThread, this, i);
-    }
+	{
+		std::lock_guard<std::mutex> lock(scheduler_mutex);
+		if (running.load() || memory_manager == nullptr) return;
+		running = true;
+	}
+
+	cpu_threads.reserve(Config::num_cpu);
+	for (uint32_t core = 0; core < Config::num_cpu; ++core) {
+		cpu_threads.emplace_back(&Scheduler::cpuWorkerThread, this,
+			static_cast<int>(core));
+	}
+	waiting_thread = std::thread(&Scheduler::waitingTimerThread, this);
 }
 
 void Scheduler::stop() {
-    running = false;
-    stopBatchGeneration();
-    cv_work.notify_all();
+	if (!running.exchange(false)) {
+		stopBatchGeneration();
+		return;
+	}
 
-    for (auto& t : cpu_threads) {
-        if (t.joinable()) t.join();
-    }
-    cpu_threads.clear();
+	stopBatchGeneration();
+	cv_work.notify_all();
+	cv_state.notify_all();
+
+	for (std::thread& thread : cpu_threads) {
+		if (thread.joinable()) thread.join();
+	}
+	cpu_threads.clear();
+	if (waiting_thread.joinable()) waiting_thread.join();
 }
 
 bool Scheduler::createProcess(const std::string& name, uint32_t memory_size) {
-    std::lock_guard<std::mutex> lock(scheduler_mutex);
-    for (const auto& proc : process_list) {
-        if (proc->name == name) return false;
-    }
+	if (name.empty()) return false;
 
-    auto proc = std::make_shared<Process>(name, next_process_id++, memory_size, 0);
-    if (!memory_manager->allocateMemory(proc.get())) return false;
+	std::lock_guard<std::mutex> lock(scheduler_mutex);
+	if (memory_manager == nullptr) return false;
+	for (const auto& process : process_list) {
+		if (process->name == name) return false;
+	}
 
-    proc->instructions = InstructionUtils::generateRandomInstructions(Config::min_ins, Config::max_ins);
-    process_list.push_back(proc);
-    ready_queue.push(proc);
-    cv_work.notify_one();
-    return true;
+	auto process = std::make_shared<Process>(name, next_process_id.fetch_add(1),
+		memory_size, 0);
+	if (!memory_manager->allocateMemory(process.get())) return false;
+
+	process->instructions = InstructionUtils::generateRandomInstructions(
+		Config::min_ins, Config::max_ins, memory_size);
+	if (process->instructions.empty()) {
+		memory_manager->deallocateMemory(process.get());
+		return false;
+	}
+
+	process_list.push_back(process);
+	ready_queue.push(process);
+	cv_work.notify_one();
+	return true;
 }
 
 bool Scheduler::createProcess(const std::string& name, uint32_t memory_size, const std::string& custom_ins) {
-    std::lock_guard<std::mutex> lock(scheduler_mutex);
-    for (const auto& proc : process_list) {
-        if (proc->name == name) return false;
-    }
+	if (name.empty()) return false;
+	std::vector<std::string> instructions =
+		InstructionUtils::parseCustomInstructions(custom_ins);
+	if (instructions.empty()) return false;
 
-    auto proc = std::make_shared<Process>(name, next_process_id++, memory_size, 0);
-    if (!memory_manager->allocateMemory(proc.get())) return false;
+	std::lock_guard<std::mutex> lock(scheduler_mutex);
+	if (memory_manager == nullptr) return false;
+	for (const auto& process : process_list) {
+		if (process->name == name) return false;
+	}
 
-    proc->instructions = InstructionUtils::parseCustomInstructions(custom_ins);
-    process_list.push_back(proc);
-    ready_queue.push(proc);
-    cv_work.notify_one();
-    return true;
+	auto process = std::make_shared<Process>(name, next_process_id.fetch_add(1),
+		memory_size, 0);
+	if (!memory_manager->allocateMemory(process.get())) return false;
+	process->instructions = std::move(instructions);
+
+	process_list.push_back(process);
+	ready_queue.push(process);
+	cv_work.notify_one();
+	return true;
 }
 
 void Scheduler::startBatchGeneration() {
-    if (generating_batch) return;
-    generating_batch = true;
-    generator_thread = std::thread(&Scheduler::batchGeneratorThread, this);
+	if (!running.load()) return;
+	bool expected = false;
+	if (!generating_batch.compare_exchange_strong(expected, true)) return;
+
+	if (generator_thread.joinable()) generator_thread.join();
+	generator_thread = std::thread(&Scheduler::batchGeneratorThread, this);
 }
 
 void Scheduler::stopBatchGeneration() {
-    generating_batch = false;
-    if (generator_thread.joinable()) {
-        generator_thread.join();
-    }
+	generating_batch = false;
+	cv_state.notify_all();
+	if (generator_thread.joinable()) generator_thread.join();
 }
 
 void Scheduler::batchGeneratorThread() {
-    static int batch_counter = 1;
-    while (running && generating_batch) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(Config::batch_process_freq * 100));
-        std::string p_name = "p" + std::to_string(batch_counter++);
-        createProcess(p_name, Config::min_mem_per_proc);
-    }
+	uint64_t elapsed_cycles = 0;
+	while (running.load() && generating_batch.load()) {
+		{
+			std::unique_lock<std::mutex> lock(scheduler_mutex);
+			cv_state.wait_for(lock, CPU_CYCLE_DURATION, [this] {
+				return !running.load() || !generating_batch.load();
+			});
+		}
+		if (!running.load() || !generating_batch.load()) break;
+
+		elapsed_cycles++;
+		if (elapsed_cycles < Config::batch_process_freq) continue;
+		elapsed_cycles = 0;
+
+		// Skip colliding names without losing the generation cycle.
+		for (uint32_t attempt = 0; attempt < 1000; ++attempt) {
+			const std::string name = makeBatchName(
+				next_batch_number.fetch_add(1));
+			if (createProcess(name, rollProcessMemory())) break;
+		}
+	}
+}
+
+void Scheduler::waitingTimerThread() {
+	while (running.load()) {
+		bool process_became_ready = false;
+		{
+			std::unique_lock<std::mutex> lock(scheduler_mutex);
+			cv_state.wait_for(lock, CPU_CYCLE_DURATION, [this] {
+				return !running.load();
+			});
+			if (!running.load()) break;
+
+			for (const auto& process : process_list) {
+				std::lock_guard<std::mutex> process_lock(process->process_mutex);
+				if (process->state != ProcessState::WAITING) continue;
+				if (process->sleep_ticks_remaining > 0) {
+					process->sleep_ticks_remaining--;
+				}
+				if (process->sleep_ticks_remaining == 0) {
+					process->state = ProcessState::READY;
+					ready_queue.push(process);
+					process_became_ready = true;
+				}
+			}
+		}
+
+		if (process_became_ready) cv_work.notify_all();
+	}
 }
 
 void Scheduler::cpuWorkerThread(int core_id) {
-    while (running) {
-        std::shared_ptr<Process> current_proc = nullptr;
-        {
-            std::unique_lock<std::mutex> lock(scheduler_mutex);
-            cv_work.wait_for(lock, std::chrono::milliseconds(10), [this] {
-                return !ready_queue.empty() || !running;
-            });
+	while (running.load()) {
+		std::shared_ptr<Process> current_process;
+		{
+			std::unique_lock<std::mutex> lock(scheduler_mutex);
+			cv_work.wait_for(lock, CPU_CYCLE_DURATION, [this] {
+				return !ready_queue.empty() || !running.load();
+			});
+			if (!running.load()) break;
+			if (ready_queue.empty()) {
+				idle_ticks++;
+				continue;
+			}
 
-            if (!running) break;
+			current_process = ready_queue.front();
+			ready_queue.pop();
+		}
 
-            if (ready_queue.empty()) {
-                idle_ticks++;
-                continue;
-            }
+		{
+			std::lock_guard<std::mutex> process_lock(
+				current_process->process_mutex);
+			if (current_process->state != ProcessState::READY) continue;
+			current_process->state = ProcessState::RUNNING;
+			current_process->assigned_core = core_id;
+			current_process->quantum_remaining = Config::quantum_cycles;
+		}
 
-            current_proc = ready_queue.front();
-            ready_queue.pop();
-        }
+		bool assigned = true;
+		while (running.load() && assigned) {
+			std::this_thread::sleep_for(CPU_CYCLE_DURATION);
+			if (!running.load()) break;
 
-        active_ticks++;
-        {
-            std::lock_guard<std::mutex> proc_lock(current_proc->process_mutex);
-            current_proc->state = ProcessState::RUNNING;
-            current_proc->assigned_core = core_id;
-            current_proc->quantum_remaining = Config::quantum_cycles;
-        }
+			bool should_finish = false;
+			bool should_wait = false;
+			bool should_requeue = false;
+			{
+				std::lock_guard<std::mutex> process_lock(
+					current_process->process_mutex);
+				if (current_process->state != ProcessState::RUNNING ||
+					current_process->assigned_core != core_id) {
+					assigned = false;
+					continue;
+				}
 
-        while (running) {
-            bool finished = false;
-            bool violation_occurred = false;
+				active_ticks++;
+				if (current_process->delay_ticks_remaining > 0) {
+					current_process->delay_ticks_remaining--;
+				}
+				else if (current_process->program_counter >=
+					current_process->instructions.size()) {
+					should_finish = true;
+				}
+				else {
+					const std::string instruction = current_process->instructions[
+						current_process->program_counter];
+					const bool succeeded = InstructionUtils::executeInstruction(
+						current_process.get(), memory_manager, instruction);
+					if (!succeeded) {
+						should_finish = true;
+					}
+					else {
+						current_process->program_counter++;
+						current_process->delay_ticks_remaining =
+							Config::delays_per_exec;
+						if (current_process->program_counter >=
+							current_process->instructions.size()) {
+							should_finish = true;
+						}
+						else if (current_process->sleep_ticks_remaining > 0) {
+							should_wait = true;
+						}
+					}
+				}
 
-            {
-                std::lock_guard<std::mutex> proc_lock(current_proc->process_mutex);
-                if (current_proc->program_counter >= current_proc->instructions.size()) {
-                    finished = true;
-                } else {
-                    std::string ins = current_proc->instructions[current_proc->program_counter];
-                    if (!InstructionUtils::executeInstruction(current_proc.get(), memory_manager, ins)) {
-                        violation_occurred = true;
-                    } else {
-                        current_proc->program_counter++;
-                    }
-                }
-            }
+				if (should_finish) {
+					current_process->state = ProcessState::FINISHED;
+					current_process->assigned_core = -1;
+					current_process->sleep_ticks_remaining = 0;
+					assigned = false;
+				}
+				else if (should_wait) {
+					current_process->state = ProcessState::WAITING;
+					current_process->assigned_core = -1;
+					assigned = false;
+				}
+				else if (Config::scheduler == "rr") {
+					if (current_process->quantum_remaining > 0) {
+						current_process->quantum_remaining--;
+					}
+					if (current_process->quantum_remaining == 0) {
+						current_process->state = ProcessState::READY;
+						current_process->assigned_core = -1;
+						should_requeue = true;
+						assigned = false;
+					}
+				}
+			}
 
-            if (Config::delays_per_exec > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(Config::delays_per_exec));
-            }
+			if (should_finish) {
+				memory_manager->deallocateMemory(current_process.get());
+			}
+			else if (should_requeue) {
+				{
+					std::lock_guard<std::mutex> lock(scheduler_mutex);
+					ready_queue.push(current_process);
+				}
+				cv_work.notify_one();
+			}
+		}
 
-            if (finished || violation_occurred) {
-                std::lock_guard<std::mutex> proc_lock(current_proc->process_mutex);
-                current_proc->state = ProcessState::FINISHED;
-                current_proc->assigned_core = -1;
-                memory_manager->deallocateMemory(current_proc.get());
-                break;
-            }
+		if (!running.load()) {
+			std::lock_guard<std::mutex> process_lock(
+				current_process->process_mutex);
+			if (current_process->state == ProcessState::RUNNING &&
+				current_process->assigned_core == core_id) {
+				current_process->state = ProcessState::READY;
+				current_process->assigned_core = -1;
+			}
+		}
+	}
+}
 
-            if (Config::scheduler == "rr") {
-                std::lock_guard<std::mutex> proc_lock(current_proc->process_mutex);
-                current_proc->quantum_remaining--;
-                if (current_proc->quantum_remaining == 0) {
-                    current_proc->state = ProcessState::READY;
-                    current_proc->assigned_core = -1;
-                    
-                    std::lock_guard<std::mutex> lock(scheduler_mutex);
-                    ready_queue.push(current_proc);
-                    break;
-                }
-            }
-        }
-    }
+std::string Scheduler::stateToText(ProcessState state) {
+	switch (state) {
+	case ProcessState::RUNNING:
+		return "RUNNING";
+	case ProcessState::WAITING:
+		return "WAITING";
+	case ProcessState::FINISHED:
+		return "FINISHED";
+	case ProcessState::READY:
+	default:
+		return "READY";
+	}
+}
+
+ProcessView Scheduler::makeProcessView(const Process& process) const {
+	ProcessView view;
+	view.name = process.name;
+	view.id = process.id;
+	view.status = stateToText(process.state);
+	view.core = process.assigned_core;
+	view.currentInstruction = process.program_counter;
+	view.totalInstructions = static_cast<uint32_t>(process.instructions.size());
+	view.memorySize = process.memory_size;
+	view.residentMemory = memory_manager == nullptr
+		? 0
+		: memory_manager->getResidentMemory(&process);
+	view.accessViolation = process.access_violation;
+	view.violationTime = process.violation_time;
+	view.invalidAddress = process.invalid_address;
+	view.logs = process.logs;
+	return view;
 }
 
 bool Scheduler::getProcessByName(const std::string& name, ProcessView& out_view, bool include_finished) {
-    std::lock_guard<std::mutex> lock(scheduler_mutex);
-    for (const auto& proc : process_list) {
-        if (proc->name == name) {
-            std::lock_guard<std::mutex> proc_lock(proc->process_mutex);
-            if (!include_finished && proc->state == ProcessState::FINISHED) return false;
-
-            out_view.name = proc->name;
-            out_view.id = proc->id;
-            out_view.status = (proc->state == ProcessState::RUNNING) ? "RUNNING" :
-                             (proc->state == ProcessState::FINISHED) ? "FINISHED" : "READY";
-            out_view.core = proc->assigned_core;
-            out_view.currentInstruction = proc->program_counter;
-            out_view.totalInstructions = proc->instructions.size();
-            out_view.memorySize = proc->memory_size;
-            out_view.residentMemory = proc->getResidentMemory(Config::mem_per_frame);
-            out_view.accessViolation = proc->access_violation;
-            out_view.violationTime = proc->violation_time;
-            out_view.invalidAddress = proc->invalid_address;
-            out_view.logs = proc->logs;
-            return true;
-        }
-    }
-    return false;
+	std::lock_guard<std::mutex> lock(scheduler_mutex);
+	for (const auto& process : process_list) {
+		if (process->name != name) continue;
+		std::lock_guard<std::mutex> process_lock(process->process_mutex);
+		if (!include_finished && process->state == ProcessState::FINISHED) {
+			return false;
+		}
+		out_view = makeProcessView(*process);
+		return true;
+	}
+	return false;
 }
 
 double Scheduler::getCPUUtilization() const {
-    uint64_t total = getTotalCpuTicks();
-    if (total == 0) return 0.0;
-    return (static_cast<double>(active_ticks) / total) * 100.0;
+	const uint64_t total = getTotalCpuTicks();
+	if (total == 0) return 0.0;
+	return static_cast<double>(active_ticks.load()) * 100.0 /
+		static_cast<double>(total);
 }
 
 int Scheduler::getUsedCores() const {
-    std::lock_guard<std::mutex> lock(scheduler_mutex);
-    int used = 0;
-    for (const auto& proc : process_list) {
-        std::lock_guard<std::mutex> proc_lock(proc->process_mutex);
-        if (proc->state == ProcessState::RUNNING) used++;
-    }
-    return used;
+	std::lock_guard<std::mutex> lock(scheduler_mutex);
+	int used_cores = 0;
+	for (const auto& process : process_list) {
+		std::lock_guard<std::mutex> process_lock(process->process_mutex);
+		if (process->state == ProcessState::RUNNING) used_cores++;
+	}
+	return std::min(used_cores, static_cast<int>(Config::num_cpu));
 }
 
 int Scheduler::getAvailableCores() const {
-    return Config::num_cpu - getUsedCores();
+	return std::max(0, static_cast<int>(Config::num_cpu) - getUsedCores());
 }
 
 std::vector<ProcessView> Scheduler::getRunningProcessViews() {
-    std::vector<ProcessView> views;
-    std::lock_guard<std::mutex> lock(scheduler_mutex);
-    for (const auto& proc : process_list) {
-        std::lock_guard<std::mutex> proc_lock(proc->process_mutex);
-        if (proc->state == ProcessState::RUNNING || proc->state == ProcessState::READY) {
-            ProcessView v;
-            v.name = proc->name;
-            v.status = (proc->state == ProcessState::RUNNING) ? "RUNNING" : "READY";
-            v.core = proc->assigned_core;
-            v.currentInstruction = proc->program_counter;
-            v.totalInstructions = proc->instructions.size();
-            v.residentMemory = proc->getResidentMemory(Config::mem_per_frame);
-            views.push_back(v);
-        }
-    }
-    return views;
+	std::vector<ProcessView> views;
+	std::lock_guard<std::mutex> lock(scheduler_mutex);
+	for (const auto& process : process_list) {
+		std::lock_guard<std::mutex> process_lock(process->process_mutex);
+		if (process->state != ProcessState::FINISHED) {
+			views.push_back(makeProcessView(*process));
+		}
+	}
+	return views;
 }
 
 std::vector<ProcessView> Scheduler::getFinishedProcessViews() {
-    std::vector<ProcessView> views;
-    std::lock_guard<std::mutex> lock(scheduler_mutex);
-    for (const auto& proc : process_list) {
-        std::lock_guard<std::mutex> proc_lock(proc->process_mutex);
-        if (proc->state == ProcessState::FINISHED) {
-            ProcessView v;
-            v.name = proc->name;
-            v.status = "FINISHED";
-            v.currentInstruction = proc->program_counter;
-            v.totalInstructions = proc->instructions.size();
-            views.push_back(v);
-        }
-    }
-    return views;
+	std::vector<ProcessView> views;
+	std::lock_guard<std::mutex> lock(scheduler_mutex);
+	for (const auto& process : process_list) {
+		std::lock_guard<std::mutex> process_lock(process->process_mutex);
+		if (process->state == ProcessState::FINISHED) {
+			views.push_back(makeProcessView(*process));
+		}
+	}
+	return views;
 }
