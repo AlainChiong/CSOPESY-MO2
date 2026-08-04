@@ -1,5 +1,5 @@
-#ifndef PROCESS_H
-#define PROCESS_H
+#ifndef PROCESS1_H
+#define PROCESS1_H
 
 #include <cstdint>
 #include <mutex>

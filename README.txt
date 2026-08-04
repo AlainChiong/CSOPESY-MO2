@@ -13,7 +13,7 @@ src/main.cpp
 
 Instructions:
 
-delete build folder then run this
+Remove-Item -Recurse -Force build , Do this if there is a build folder
 mkdir build
 cd build
 cmake .. -G "MinGW Makefiles"
