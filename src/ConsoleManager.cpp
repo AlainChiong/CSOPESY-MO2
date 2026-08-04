@@ -166,11 +166,16 @@ namespace {
 			error_message = "scheduler must be either fcfs or rr.";
 			return false;
 		}
-		if (parsed.quantum_cycles < 1 || parsed.batch_process_freq < 1 ||
-			parsed.min_ins < 1 || parsed.max_ins < 1) {
-			error_message = "Scheduler cycle and instruction values must be positive.";
-			return false;
-		}
+		if (parsed.scheduler == "rr" && parsed.quantum_cycles < 1) {
+            error_message = "quantum-cycles must be positive when using rr.";
+            return false;
+        }
+
+        if (parsed.batch_process_freq < 1 || parsed.min_ins < 1 || parsed.max_ins < 1) {
+            error_message = "Batch frequency and instruction values must be positive.";
+            return false;
+        }
+
 		if (parsed.min_ins > parsed.max_ins) {
 			error_message = "min-ins cannot be greater than max-ins.";
 			return false;
