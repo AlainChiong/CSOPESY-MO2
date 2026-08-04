@@ -40,13 +40,15 @@ struct Config {
     inline static uint32_t max_overall_mem = 16384; 
     
     // The size of memory in bytes per frame (and per page).
-    inline static uint32_t mem_per_frame = 16;
+    inline static uint32_t mem_per_frame = 64;
     
     // Minimum memory required for each process.
     inline static uint32_t min_mem_per_proc = 64;
     
     // Maximum memory required for each process.
     inline static uint32_t max_mem_per_proc = 256;
+
+    inline static bool is_initialized = false;
 };
 
 #endif
